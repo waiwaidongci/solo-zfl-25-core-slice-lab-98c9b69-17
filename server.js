@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Store, isValidSliceId, PathEscapeError } from "./lib/store.js";
+import { Store, isValidSliceId, PathEscapeError, SliceKeyConflict } from "./lib/store.js";
 import { decodePng, PngError } from "./lib/png.js";
 import { laplacianVariance, imageHash } from "./lib/vision.js";
 import { analyzeGrid, stitchMosaic } from "./lib/stitch.js";
@@ -654,5 +654,25 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-await store.init();
-server.listen(port, () => console.log(`Core slice lab app listening on http://localhost:${port} (micro workbench: /micro)`));
+async function main() {
+  try {
+    await store.init();
+  } catch (error) {
+    if (error instanceof SliceKeyConflict) {
+      console.error("启动中止：检测到切片编号在多个样本中重复（显微接口按编号定位，重复键会导致数据被错误占用）。");
+      for (const c of error.conflicts) {
+        console.error(`  重复切片编号 ${JSON.stringify(c.sliceId)}（${c.count} 处）：样本 ${c.sampleIds.map(id => JSON.stringify(id)).join("、")}`);
+      }
+      console.error("请先合并/改名冲突切片后再启动。本次启动未修改任何数据。");
+      // Don't call process.exit() here: it can cut off piped console output
+      // before it drains. The HTTP server has never listened, so setting the
+      // exit code lets the event loop flush stderr and then terminate on its own.
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+  server.listen(port, () => console.log(`Core slice lab app listening on http://localhost:${port} (micro workbench: /micro)`));
+}
+
+main();

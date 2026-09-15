@@ -1,6 +1,6 @@
 {
   "name": "zfl-25-core-slice-lab",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "test:codec": "node scripts/test-codec.mjs",
     "test:e2e": "node scripts/e2e.mjs",
     "test:browser": "node scripts/browser-harness.mjs",
-    "test": "npm run fixtures && npm run test:codec && npm run test:e2e && npm run test:browser"
+    "test:conflict": "node scripts/test-conflicts.mjs",
+    "test": "npm run fixtures && npm run test:codec && npm run test:e2e && npm run test:browser && npm run test:conflict"
   }
 }
