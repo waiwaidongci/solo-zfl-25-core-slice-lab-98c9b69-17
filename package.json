@@ -1,9 +1,13 @@
 {
   "name": "zfl-25-core-slice-lab",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "fixtures": "node scripts/fixtures.js",
+    "test:codec": "node scripts/test-codec.mjs",
+    "test:e2e": "node scripts/e2e.mjs",
+    "test": "npm run fixtures && npm run test:codec && npm run test:e2e"
   }
 }
