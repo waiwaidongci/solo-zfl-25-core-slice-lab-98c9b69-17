@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Store } from "./lib/store.js";
+import { Store, isValidSliceId, PathEscapeError } from "./lib/store.js";
 import { decodePng, PngError } from "./lib/png.js";
 import { laplacianVariance, imageHash } from "./lib/vision.js";
 import { analyzeGrid, stitchMosaic } from "./lib/stitch.js";
@@ -79,7 +79,12 @@ function sendJson(res, status, data) {
 }
 
 function sendError(res, error) {
-  const status = error.status || (error instanceof PngError ? 422 : error instanceof MeasureError ? 422 : 500);
+  let status;
+  if (error instanceof HttpError) status = error.status;
+  else if (error instanceof PathEscapeError) status = 400;
+  else if (error instanceof PngError) status = 422;
+  else if (error instanceof MeasureError) status = 422;
+  else status = 500;
   const code = error.code || error.message || "internal_error";
   sendJson(res, status, { error: code });
 }
@@ -108,6 +113,19 @@ function requireSlice(db, sliceId) {
   const hit = findSlice(db, sliceId);
   if (!hit) throw new HttpError(404, "slice_not_found");
   return hit;
+}
+
+// Decode a slice id from a URL and reject anything that is not a plain label,
+// so traversal sequences (.. %2f, encoded separators, NUL) never reach storage.
+function decodeSliceId(raw) {
+  let id;
+  try {
+    id = decodeURIComponent(raw);
+  } catch {
+    throw new HttpError(400, "invalid_slice_id");
+  }
+  if (!isValidSliceId(id)) throw new HttpError(400, "invalid_slice_id");
+  return id;
 }
 
 // ---- Microscopy domain rules ------------------------------------------------
@@ -167,12 +185,20 @@ async function registerCalibration(db, slice, input) {
   const cols = Number(input.cols);
   const overlap = Number(input.overlap);
   if (![40, 100, 200, 400].includes(magnification)) throw new HttpError(422, "invalid_magnification");
-  if (!(scaleLengthUm > 0) || !(scalePixels > 0)) throw new HttpError(422, "invalid_scale");
+  // Both scale values must be finite, positive, and within sane physical bounds.
+  // Non-finite input (Infinity/NaN) must be rejected up front, otherwise umPerPx
+  // serialises to null and every later measurement silently fails downstream.
+  if (!Number.isFinite(scaleLengthUm) || !Number.isFinite(scalePixels)
+    || !(scaleLengthUm > 0) || !(scalePixels > 0)
+    || scaleLengthUm > 1_000_000 || scalePixels > 100_000_000) {
+    throw new HttpError(422, "invalid_scale");
+  }
   if (!Number.isInteger(rows) || !Number.isInteger(cols) || rows < 1 || cols < 1 || rows > 10 || cols > 10) {
     throw new HttpError(422, "invalid_grid");
   }
   if (!(overlap >= 5 && overlap <= 60)) throw new HttpError(422, "invalid_overlap");
   const umPerPx = scaleLengthUm / scalePixels;
+  if (!Number.isFinite(umPerPx) || !(umPerPx > 0)) throw new HttpError(422, "invalid_scale");
 
   const existing = slice.micro;
   const shapeChanged = existing?.calibration && (
@@ -462,6 +488,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && path === "/api/samples") {
       const input = await body(req);
+      if (!isValidSliceId(input.sliceId)) throw new HttpError(422, "invalid_slice_id");
       const sample = { id: `CORE-${Date.now()}`, project: input.project, borehole: input.borehole, coreBox: input.coreBox, depth: input.depth, owner: input.owner, status: "待切割", delivery: "未交付", slices: [{ id: input.sliceId, method: input.method, observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "创建初始切片任务" }] }] };
       const out = await store.withLock(async d => {
         d.samples.unshift(sample);
@@ -475,9 +502,11 @@ const server = http.createServer(async (req, res) => {
     const addSlice = path.match(/^\/api\/samples\/([^/]+)\/slices$/);
     if (addSlice && req.method === "POST") {
       const input = await body(req);
+      if (!isValidSliceId(input.id)) throw new HttpError(422, "invalid_slice_id");
       const out = await store.withLock(async d => {
         const sample = d.samples.find(item => item.id === addSlice[1]);
         if (!sample) throw new HttpError(404, "sample_not_found");
+        if (sample.slices.some(item => item.id === input.id)) throw new HttpError(409, "slice_id_exists");
         sample.slices.push({ id: input.id, method: input.method || "未指定", observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "新增切片任务" }] });
         updateSampleStatus(sample);
         await store.flush();
@@ -520,7 +549,7 @@ const server = http.createServer(async (req, res) => {
     // ---- Microscopy API ----
     const sliceMicro = path.match(/^\/api\/slices\/([^/]+)\/micro$/);
     if (sliceMicro && req.method === "GET") {
-      const hit = findSlice(store.db, decodeURIComponent(sliceMicro[1]));
+      const hit = findSlice(store.db, decodeSliceId(sliceMicro[1]));
       if (!hit) return sendJson(res, 404, { error: "slice_not_found" });
       return sendJson(res, 200, microSummary(hit.slice));
     }
@@ -529,7 +558,7 @@ const server = http.createServer(async (req, res) => {
     if (calibMatch && req.method === "PUT") {
       const input = await body(req);
       const out = await store.withLock(d => {
-        const hit = requireSlice(d, decodeURIComponent(calibMatch[1]));
+        const hit = requireSlice(d, decodeSliceId(calibMatch[1]));
         return registerCalibration(d, hit.slice, input);
       });
       return sendJson(res, 200, out);
@@ -537,7 +566,7 @@ const server = http.createServer(async (req, res) => {
 
     const tileImage = path.match(/^\/api\/slices\/([^/]+)\/tiles\/([\d]+-[\d]+)\.png$/);
     if (tileImage && req.method === "GET") {
-      const hit = findSlice(store.db, decodeURIComponent(tileImage[1]));
+      const hit = findSlice(store.db, decodeSliceId(tileImage[1]));
       if (!hit) return sendJson(res, 404, { error: "slice_not_found" });
       const file = store.tilePath(hit.slice.id, tileImage[2]);
       if (!existsSync(file)) return sendJson(res, 404, { error: "tile_not_found" });
@@ -547,7 +576,7 @@ const server = http.createServer(async (req, res) => {
 
     const mosaicImage = path.match(/^\/api\/slices\/([^/]+)\/mosaic\.png$/);
     if (mosaicImage && req.method === "GET") {
-      const hit = findSlice(store.db, decodeURIComponent(mosaicImage[1]));
+      const hit = findSlice(store.db, decodeSliceId(mosaicImage[1]));
       if (!hit) return sendJson(res, 404, { error: "slice_not_found" });
       const file = store.mosaicPath(hit.slice.id);
       if (!existsSync(file)) return sendJson(res, 404, { error: "mosaic_not_found" });
@@ -557,7 +586,7 @@ const server = http.createServer(async (req, res) => {
 
     const tileMatch = path.match(/^\/api\/slices\/([^/]+)\/tiles\/([\d]+-[\d]+)$/);
     if (tileMatch && (req.method === "PUT" || req.method === "DELETE")) {
-      const sliceId = decodeURIComponent(tileMatch[1]);
+      const sliceId = decodeSliceId(tileMatch[1]);
       const key = tileMatch[2];
       if (req.method === "DELETE") {
         const out = await store.withLock(d => {
@@ -577,7 +606,7 @@ const server = http.createServer(async (req, res) => {
     const stitchMatch = path.match(/^\/api\/slices\/([^/]+)\/stitch$/);
     if (stitchMatch && req.method === "POST") {
       const out = await store.withLock(d => {
-        const hit = requireSlice(d, decodeURIComponent(stitchMatch[1]));
+        const hit = requireSlice(d, decodeSliceId(stitchMatch[1]));
         return runStitch(d, hit.slice);
       });
       return sendJson(res, 200, out);
@@ -585,7 +614,7 @@ const server = http.createServer(async (req, res) => {
     if (stitchMatch && req.method === "DELETE") {
       await body(req);
       const out = await store.withLock(d => {
-        const hit = requireSlice(d, decodeURIComponent(stitchMatch[1]));
+        const hit = requireSlice(d, decodeSliceId(stitchMatch[1]));
         return clearMosaic(d, hit.slice);
       });
       return sendJson(res, 200, out);
@@ -593,14 +622,14 @@ const server = http.createServer(async (req, res) => {
 
     const measureMatch = path.match(/^\/api\/slices\/([^/]+)\/measurements$/);
     if (measureMatch && req.method === "GET") {
-      const hit = findSlice(store.db, decodeURIComponent(measureMatch[1]));
+      const hit = findSlice(store.db, decodeSliceId(measureMatch[1]));
       if (!hit) return sendJson(res, 404, { error: "slice_not_found" });
       return sendJson(res, 200, hit.slice.micro?.measurements || []);
     }
     if (measureMatch && req.method === "POST") {
       const input = await body(req);
       const out = await store.withLock(d => {
-        const hit = requireSlice(d, decodeURIComponent(measureMatch[1]));
+        const hit = requireSlice(d, decodeSliceId(measureMatch[1]));
         return addMeasurement(d, hit.slice, input.type, input);
       });
       return sendJson(res, 201, out);

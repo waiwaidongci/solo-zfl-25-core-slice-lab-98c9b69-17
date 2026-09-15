@@ -110,6 +110,18 @@ const run = async () => {
   check("非法标尺拒绝", badScale.status === 422 && badScale.data.error === "invalid_scale");
   const badGrid = await calib(base, "S-MAIN", 0, 3);
   check("非法网格拒绝", badGrid.status === 422 && badGrid.data.error === "invalid_grid");
+
+  // Non-finite / oversized scale must be rejected up front (no null umPerPx later).
+  const infScale = await calib(base, "S-MAIN", 3, 3, { scaleLengthUm: 1e999, scalePixels: 1 });
+  check("超大标尺(Infinity)拒绝", infScale.status === 422 && infScale.data.error === "invalid_scale");
+  const nanScale = await calib(base, "S-MAIN", 3, 3, { scaleLengthUm: "abc", scalePixels: 10 });
+  check("非数值标尺(NaN)拒绝", nanScale.status === 422 && nanScale.data.error === "invalid_scale");
+  const negScale = await calib(base, "S-MAIN", 3, 3, { scaleLengthUm: -5, scalePixels: 10 });
+  check("负标尺拒绝", negScale.status === 422 && negScale.data.error === "invalid_scale");
+  const hugeButFinite = await calib(base, "S-MAIN", 3, 3, { scaleLengthUm: 1e12, scalePixels: 1 });
+  check("超量程标尺拒绝", hugeButFinite.status === 422 && hugeButFinite.data.error === "invalid_scale");
+  check("非法标尺未落库为已校准", (await J(base, "GET", "/api/slices/S-MAIN/micro")).data.calibrated === false);
+
   const c1 = await calib(base, "S-MAIN", 3, 3);
   check("校准成功 1px=0.5µm", c1.status === 200 && c1.data.calibration.umPerPx === 0.5);
 
@@ -123,6 +135,21 @@ const run = async () => {
   const junk = await B(base, "PUT", "/api/slices/S-DUP/tiles/0-1", Buffer.from("not a png at all"));
   check("非 PNG 拒绝", junk.status === 422 && junk.data.error === "not_a_png");
   check("失败后不留半张图", !existsSync(path.join(dataDir, "images", "S-DUP", "tile-0-1.png")));
+
+  // Corrupt PNG compression: valid signature/IHDR but a bit-flipped IDAT stream.
+  const validPng = await fixture("good", "0-1");
+  const corrupt = Buffer.from(validPng);
+  const idatPos = corrupt.indexOf(Buffer.from("IDAT")) + 4;
+  for (let k = 0; k < 40; k++) corrupt[idatPos + k] ^= 0xff;
+  const corruptUp = await B(base, "PUT", "/api/slices/S-DUP/tiles/0-1", corrupt);
+  check("损坏 PNG 返回 422 校验失败(非 500)",
+    corruptUp.status === 422
+    && ["invalid_compressed_data", "bad_image_data", "crc_mismatch", "truncated_chunk"].includes(corruptUp.data.error),
+    JSON.stringify(corruptUp.data));
+  check("损坏 PNG 不留半张图/记录",
+    !existsSync(path.join(dataDir, "images", "S-DUP", "tile-0-1.png"))
+    && (await J(base, "GET", "/api/slices/S-DUP/micro")).data.tiles.length === 0);
+
   const dupMicro = await J(base, "GET", "/api/slices/S-DUP/micro");
   check("失败后不留视野记录", dupMicro.data.tiles.length === 0);
 
@@ -148,6 +175,37 @@ const run = async () => {
   check("只有 1 条视野记录", afterRace.data.tiles.length === 1);
   const tileFiles = await readdir(path.join(dataDir, "images", "S-SMALL"));
   check("只有 1 个视野文件、无 tmp 残留", tileFiles.length === 1 && tileFiles[0] === "tile-0-0.png", JSON.stringify(tileFiles));
+
+  // ---- 3b. slice-id isolation: traversal must never touch the filesystem ----
+  console.log("\n[security] 非法/越界切片编号隔离");
+  const traversalIds = [
+    "..%2F..%2Fpwned",
+    "..%2F..%2Fpwned%2F",
+    encodeURIComponent("../../pwned"),
+    encodeURIComponent("../pwned"),
+    "a%00.png",
+    encodeURIComponent("x/y"),
+    encodeURIComponent("x\\y"),
+    "%2Fetc"
+  ];
+  for (const id of traversalIds) {
+    const up = await B(base, "PUT", `/api/slices/${id}/tiles/0-0`, buf);
+    check(`越界编号上传拒绝 ${id}`, up.status === 400 && up.data.error === "invalid_slice_id", JSON.stringify(up.data));
+  }
+  // Traversal must never create files/dirs outside the images directory.
+  check("images 目录之外无逃逸文件",
+    !existsSync(path.join(dataDir, "pwned"))
+    && !existsSync(path.join(dataDir, "pwned.png"))
+    && !existsSync(path.join(dataDir, "images", "..", "pwned")));
+  const created = await J(base, "POST", "/api/samples", {
+    project: "evil", borehole: "b", coreBox: "c", depth: "d", owner: "o",
+    sliceId: "../evil-slice", method: "m"
+  });
+  check("建档时非法切片编号拒绝", created.status === 422 && created.data.error === "invalid_slice_id");
+  const addSliceEvil = await J(base, "POST", "/api/samples/CORE-001/slices", { id: "../evil2", method: "m" });
+  check("加切片时非法编号拒绝", addSliceEvil.status === 422 && addSliceEvil.data.error === "invalid_slice_id");
+  const dupId = await J(base, "POST", "/api/samples/CORE-001/slices", { id: "SL-001-A", method: "m" });
+  check("重复切片编号拒绝", dupId.status === 409 && dupId.data.error === "slice_id_exists");
 
   // ---- 4. coverage / sharpness / order blocking ----
   console.log("\n[blocking] 缺图、虚焦、乱序阻断拼图与测量");
@@ -239,6 +297,22 @@ const run = async () => {
     type: "area", points: [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 0, y: 3 }]
   });
   check("面积测量 6px² / 1.5µm²", area.status === 201 && approx(area.data.pixelArea, 6) && approx(area.data.micrometres.area, 1.5));
+
+  // Double-click close appends the last vertex twice; server must collapse it
+  // rather than store a repeated point (and still return the correct area).
+  const dupClose = await J(base, "POST", "/api/slices/S-MAIN/measurements", {
+    type: "area", points: [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 0, y: 3 }, { x: 0, y: 3 }]
+  });
+  check("重复收尾顶点被折叠", dupClose.status === 201 && dupClose.data.pixels.length === 3 && approx(dupClose.data.pixelArea, 6));
+  const dupCyclic = await J(base, "POST", "/api/slices/S-MAIN/measurements", {
+    type: "area", points: [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 0, y: 3 }, { x: 0, y: 0 }]
+  });
+  check("闭合点=起点被折叠", dupCyclic.status === 201 && dupCyclic.data.pixels.length === 3);
+  const allDup = await J(base, "POST", "/api/slices/S-MAIN/measurements", {
+    type: "area", points: [{ x: 1, y: 1 }, { x: 1, y: 1 }, { x: 1, y: 1 }]
+  });
+  check("三点完全重合判退化/点数不足", allDup.status === 422
+    && ["area_needs_three_points", "degenerate_area"].includes(allDup.data.error));
   const degArea = await J(base, "POST", "/api/slices/S-MAIN/measurements", {
     type: "area", points: [{ x: 0, y: 0 }, { x: 4, y: 4 }, { x: 8, y: 8 }]
   });
@@ -256,8 +330,8 @@ const run = async () => {
   check("未知测量类型失败", badType.status === 422 && badType.data.error === "unknown_measurement_type");
 
   const measList = await J(base, "GET", "/api/slices/S-MAIN/measurements");
-  // successful: 2 points + line + area = 4; every failure must not have written a record
-  check("失败测量不落库 (恰 4 条成功记录)", measList.status === 200 && measList.data.length === 4, "n=" + measList.data?.length);
+  // successful: 2 points + line + area + two deduped areas = 6; every failure wrote no record
+  check("失败测量不落库 (恰 6 条成功记录)", measList.status === 200 && measList.data.length === 6, "n=" + measList.data?.length);
 
   // ---- 8. cross-slice coordinate isolation ----
   console.log("\n[isolation] 跨切片坐标失败");
@@ -297,7 +371,7 @@ const run = async () => {
   const after = await J(server.base, "GET", "/api/slices/S-MAIN/micro");
   check("重启后校准/视野/拼图仍在", after.data.calibrated && after.data.tiles.length === 9 && after.data.mosaic);
   const measAfter = await J(server.base, "GET", "/api/slices/S-MAIN/measurements");
-  check("重启后测量记录仍在", measAfter.data.length === 4 && approx(measAfter.data.find(m=>m.type==="line").micrometres.length, 2.5));
+  check("重启后测量记录仍在", measAfter.data.length === 6 && approx(measAfter.data.find(m=>m.type==="line").micrometres.length, 2.5));
   const pngAfter = await fetch(server.base + "/api/slices/S-MAIN/mosaic.png");
   check("重启后拼图文件仍可下载", pngAfter.status === 200);
   const restoredBytes = Buffer.from(await pngAfter.arrayBuffer());
