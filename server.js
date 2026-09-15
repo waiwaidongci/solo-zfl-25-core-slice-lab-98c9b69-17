@@ -109,6 +109,17 @@ function findSlice(db, sliceId) {
   return null;
 }
 
+// Slice ids are the key for every microscopy route, so they must be unique
+// across ALL samples (not just within one). Check inside the write lock so
+// concurrent creates of the same id only succeed once.
+function assertSliceIdFree(db, sliceId) {
+  for (const sample of db.samples) {
+    if (sample.slices.some(s => s.id === sliceId)) {
+      throw new HttpError(409, "slice_id_exists");
+    }
+  }
+}
+
 function requireSlice(db, sliceId) {
   const hit = findSlice(db, sliceId);
   if (!hit) throw new HttpError(404, "slice_not_found");
@@ -489,8 +500,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && path === "/api/samples") {
       const input = await body(req);
       if (!isValidSliceId(input.sliceId)) throw new HttpError(422, "invalid_slice_id");
-      const sample = { id: `CORE-${Date.now()}`, project: input.project, borehole: input.borehole, coreBox: input.coreBox, depth: input.depth, owner: input.owner, status: "待切割", delivery: "未交付", slices: [{ id: input.sliceId, method: input.method, observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "创建初始切片任务" }] }] };
       const out = await store.withLock(async d => {
+        assertSliceIdFree(d, input.sliceId);
+        const sample = { id: `CORE-${Date.now()}`, project: input.project, borehole: input.borehole, coreBox: input.coreBox, depth: input.depth, owner: input.owner, status: "待切割", delivery: "未交付", slices: [{ id: input.sliceId, method: input.method, observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "创建初始切片任务" }] }] };
         d.samples.unshift(sample);
         updateSampleStatus(sample);
         await store.flush();
@@ -506,7 +518,7 @@ const server = http.createServer(async (req, res) => {
       const out = await store.withLock(async d => {
         const sample = d.samples.find(item => item.id === addSlice[1]);
         if (!sample) throw new HttpError(404, "sample_not_found");
-        if (sample.slices.some(item => item.id === input.id)) throw new HttpError(409, "slice_id_exists");
+        assertSliceIdFree(d, input.id); // unique across every sample
         sample.slices.push({ id: input.id, method: input.method || "未指定", observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "新增切片任务" }] });
         updateSampleStatus(sample);
         await store.flush();

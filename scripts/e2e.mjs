@@ -205,7 +205,67 @@ const run = async () => {
   const addSliceEvil = await J(base, "POST", "/api/samples/CORE-001/slices", { id: "../evil2", method: "m" });
   check("加切片时非法编号拒绝", addSliceEvil.status === 422 && addSliceEvil.data.error === "invalid_slice_id");
   const dupId = await J(base, "POST", "/api/samples/CORE-001/slices", { id: "SL-001-A", method: "m" });
-  check("重复切片编号拒绝", dupId.status === 409 && dupId.data.error === "slice_id_exists");
+  check("同样本重复切片编号拒绝", dupId.status === 409 && dupId.data.error === "slice_id_exists");
+
+  // ---- 3c. slice id must be unique across ALL samples ----
+  console.log("\n[unique] 切片编号跨样本全局唯一");
+  const sampleCountBefore = (await J(base, "GET", "/api/samples")).data.length;
+  // A normal first creation with a Chinese id (legacy-friendly) must still work.
+  const cnId = "薄片-全局-甲";
+  const ownerSample = await newSample(base, cnId);
+  check("合法中文编号建档成功", typeof ownerSample === "string" && ownerSample.startsWith("CORE-"));
+  // Creating a NEW sample carrying the same slice id must be rejected.
+  const createBody = {
+    project: "另一个样本", borehole: "ZK-O", coreBox: "BX-O", depth: "9m",
+    owner: "他人", sliceId: cnId, method: "无染色"
+  };
+  const crossCreate = await J(base, "POST", "/api/samples", createBody);
+  check("跨样本建档重复编号拒绝", crossCreate.status === 409 && crossCreate.data.error === "slice_id_exists");
+  // Adding that id to an unrelated sample must also be rejected.
+  const crossAdd = await J(base, "POST", `/api/samples/${ownerSample}/slices`, { id: cnId, method: "m" });
+  check("跨样本追加重复编号拒绝", crossAdd.status === 409 && crossAdd.data.error === "slice_id_exists");
+  // Failure must not change the samples list, images, mosaic or measurements.
+  const uniqAfter = await J(base, "GET", "/api/samples");
+  const sliceOccurrences = uniqAfter.data.reduce(
+    (n, s) => n + s.slices.filter(x => x.id === cnId).length, 0);
+  check("失败后样本数不变", uniqAfter.data.length === sampleCountBefore + 1,
+    `before+1=${sampleCountBefore + 1} got=${uniqAfter.data.length}`);
+  check("失败后该编号仍只出现一次", sliceOccurrences === 1, "n=" + sliceOccurrences);
+  check("失败后不产生影像目录", !existsSync(path.join(dataDir, "images", cnId)));
+
+  // Concurrent duplicate creation across samples: exactly one must win.
+  const raceId = "薄片-并发-同号";
+  const raceReqs = Array.from({ length: 8 }, (_, i) =>
+    J(base, "POST", "/api/samples", {
+      project: "并发-" + i, borehole: "ZK-R", coreBox: "BX-R", depth: "1m",
+      owner: "r", sliceId: raceId, method: "m"
+    }));
+  const raceResults = await Promise.all(raceReqs);
+  const raceWins = raceResults.filter(r => r.status === 201).length;
+  const raceLost = raceResults.filter(r => r.status === 409 && r.data.error === "slice_id_exists").length;
+  check("并发建档同号恰好 1 个成功", raceWins === 1, "wins=" + raceWins);
+  check("其余并发同号全部 409", raceLost === 7, "lost=" + raceLost);
+  const raceSamples = await J(base, "GET", "/api/samples");
+  const raceOccurrences = raceSamples.data.reduce(
+    (n, s) => n + s.slices.filter(x => x.id === raceId).length, 0);
+  check("并发后同号全局仅一条切片", raceOccurrences === 1, "n=" + raceOccurrences);
+  check("并发失败不产生多余影像目录",
+    (await readdir(path.join(dataDir, "images")).catch(() => [])).filter(f => f === raceId).length === 0);
+
+  // Concurrent add-slice to two different existing samples with the same new id.
+  const sA = await newSample(base, "S-CONC-A");
+  const sB = await newSample(base, "S-CONC-B");
+  const sharedId = "薄片-并发-追加";
+  const addRace = await Promise.all([sA, sB].map(sampleId =>
+    J(base, "POST", `/api/samples/${sampleId}/slices`, { id: sharedId, method: "m" })));
+  const addWins = addRace.filter(r => r.status === 201).length;
+  const addLost = addRace.filter(r => r.status === 409).length;
+  check("并发追加同号到两样本恰好 1 个成功", addWins === 1 && addLost === 1,
+    JSON.stringify(addRace.map(r => r.status)));
+  const addSamples = await J(base, "GET", "/api/samples");
+  const addOcc = addSamples.data.reduce(
+    (n, s) => n + s.slices.filter(x => x.id === sharedId).length, 0);
+  check("并发追加后同号全局仅一条切片", addOcc === 1, "n=" + addOcc);
 
   // ---- 4. coverage / sharpness / order blocking ----
   console.log("\n[blocking] 缺图、虚焦、乱序阻断拼图与测量");
@@ -382,7 +442,13 @@ const run = async () => {
   check("启动清理无主切片目录文件", !existsSync(path.join(ghostDir, "tile-0-0.png")) && !existsSync(path.join(ghostDir, "tile-0-0.png.upload-9-9")));
 
   const samplesAfter = await J(server.base, "GET", "/api/samples");
-  check("重启后样本与旧数据完整", samplesAfter.data.some(s => s.id === "CORE-001") && samplesAfter.data.length === 6);
+  // seed CORE-001 + 5 setup samples + 4 uniqueness samples
+  // (one Chinese-id owner, one concurrent-create winner, CONC-A, CONC-B);
+  // every rejected/raced duplicate created nothing.
+  const expectedSamples = 10;
+  check("重启后样本与旧数据完整", samplesAfter.data.some(s => s.id === "CORE-001")
+    && samplesAfter.data.length === expectedSamples,
+    `got=${samplesAfter.data.length} want=${expectedSamples}`);
 
   server.child.kill("SIGTERM");
   await new Promise(r => server.child.on("exit", r));
